@@ -2,7 +2,7 @@
 //
 // 1.0.0 - Inicialna verzija
 // UBL 2.1 (HR CIUS 2025) XML → Human readable
-// Vibe code by Dalibor Klobučarić 
+// Vibe code by ChatGPT by Dalibor Klobučarić 
 // and ChatGPT
 // 
 
@@ -136,11 +136,17 @@ function parseUblInvoice(string $xml): array {
 
   // Lines
   foreach ($xp->query('/ubl:Invoice/cac:InvoiceLine') as $line) {
-    /** @var DOMElement $line */
+   /** @var DOMElement|null $qtyN */
+$qtyN = $xp->query('cbc:InvoicedQuantity', $line)->item(0);
 
-    $qtyN = $xp->query('cbc:InvoicedQuantity', $line)->item(0);
-    $qty  = $qtyN ? trim($qtyN->textContent) : '';
-    $uom  = ($qtyN && $qtyN->hasAttribute('unitCode')) ? $qtyN->getAttribute('unitCode') : '';
+$qty = ($qtyN instanceof DOMElement)
+  ? trim($qtyN->textContent)
+  : '';
+
+$uom = ($qtyN instanceof DOMElement && $qtyN->hasAttribute('unitCode'))
+  ? $qtyN->getAttribute('unitCode')
+  : '';
+
 
     $data['lines'][] = [
       'id'          => xpValueCtx($xp, 'cbc:ID', $line),
