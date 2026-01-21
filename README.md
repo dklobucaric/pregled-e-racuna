@@ -12,8 +12,9 @@ Vajbkodana s ChatGPTjem
   - zaglavlja računa
   - stavki i iznosa
 - Automatsko prepoznavanje Base64 PDF-a
-- Preuzimanje PDF-a iz XML-a
+- Preuzimanje PDF-a iz XML-a (ako je embedani)
 - Jednostavan HTML prikaz bez baze podataka
+- Dodani 2D barcode HUB3 za brže plaćanje putem aplikacije
 - Single file riješenje
 
 ## Tehnologije
@@ -48,6 +49,5 @@ Detalji su u [LICENSE](LICENSE) datoteci.
 
 ## ToDo
 1. Napraviti android app koji će po defaultu otvarati XML iz (g)mail app-a
-2. 2D barcode za image2pay
-3. Print button 
-4. Learn how to vibe code better
+2. Print button 
+3. Learn how to vibe code better
