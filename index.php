@@ -1,6 +1,7 @@
 <?php
 //
 // 1.0.0 - Inicialna verzija
+// 1.0.1 - Dodani 2D barcode HUB3 za brže plaćanje putem aplikacije
 // UBL 2.1 (HR CIUS 2025) XML → Human readable
 // Vibe code by ChatGPT by Dalibor Klobučarić 
 // and ChatGPT
@@ -8,41 +9,72 @@
 
 declare(strict_types=1);
 
+const ENCRYPTION_KEY = '12345678901234567890123456789012'; // <- 32 chars (AES-256 key)
+const BARCODE_ENDPOINT = 'https://hub3.dd-lab.hr/?data=';
+
 function h(string $s): string {
   return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 }
 
-function xpValue(DOMXPath $xp, string $q): string {
-  $n = $xp->query($q)->item(0);
-  return $n ? trim($n->textContent) : '';
-}
-
-function xpValueCtx(DOMXPath $xp, string $q, ?DOMNode $ctx = null): string {
+function xpValue(DOMXPath $xp, string $q, ?DOMNode $ctx = null): string {
   $n = $xp->query($q, $ctx)->item(0);
-  return $n ? trim($n->textContent) : '';
-}
-
-function xpFirst(DOMXPath $xp, array $queries): string {
-  foreach ($queries as $q) {
-    $v = xpValue($xp, $q);
-    if ($v !== '') return $v;
-  }
-  return '';
-}
-
-function partyNameFromBase(DOMXPath $xp, string $base): string {
-  // base = XPath to cac:Party
-  return xpFirst($xp, [
-    $base . '/cac:PartyName/cbc:Name',
-    $base . '/cac:PartyLegalEntity/cbc:RegistrationName',
-    $base . '/cac:PartyLegalEntity/cbc:CompanyName',
-    $base . '/cac:PartyIdentification/cbc:ID',
-  ]);
+  return $n ? trim((string)$n->textContent) : '';
 }
 
 function normalizeIban(string $iban): string {
-  $iban = strtoupper($iban);
-  return preg_replace('/[^A-Z0-9]/', '', $iban) ?? '';
+  // makni razmake i sve što nije slovo/broj
+  $iban = preg_replace('/\s+/', '', $iban) ?? $iban;
+  $iban = preg_replace('/[^A-Za-z0-9]/', '', $iban) ?? $iban;
+  return strtoupper($iban);
+}
+
+function splitModelReference(string $paymentId): array {
+  // Primjeri iz prakse:
+  // "HR05 37567-261-015"
+  // "HR05 123-456-789"
+  $s = trim($paymentId);
+  $s = preg_replace('/\s+/', ' ', $s) ?? $s;
+
+  // uhvati "HR" + 2 znamenke (s ili bez razmaka) + ostatak
+  if (preg_match('/^(HR\s?\d{2})\s+(.*)$/i', $s, $m)) {
+    $model = strtoupper(str_replace(' ', '', $m[1])); // HR05
+    $ref   = trim($m[2]);
+    return [$model, $ref];
+  }
+
+  // fallback: ako nema modela
+  return ['', $s];
+}
+
+function encryptPayload(array $data, string $encryptionKey): string {
+  $jsonData = json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+  if ($jsonData === false) {
+    throw new RuntimeException('Ne mogu JSON-encode payload.');
+  }
+
+  if (strlen($encryptionKey) !== 32) {
+    throw new RuntimeException('ENCRYPTION_KEY mora imati točno 32 znaka (AES-256).');
+  }
+
+  $cipher = 'aes-256-cbc';
+  $ivLen = openssl_cipher_iv_length($cipher);
+  if ($ivLen === false || $ivLen <= 0) {
+    throw new RuntimeException('Ne mogu odrediti IV length za AES-256-CBC.');
+  }
+
+  $iv = openssl_random_pseudo_bytes($ivLen);
+  if ($iv === false) {
+    throw new RuntimeException('Ne mogu generirati IV.');
+  }
+
+  $encrypted = openssl_encrypt($jsonData, $cipher, $encryptionKey, OPENSSL_RAW_DATA, $iv);
+  if ($encrypted === false) {
+    throw new RuntimeException('openssl_encrypt nije uspio (provjeri openssl ekstenziju).');
+  }
+
+  $combined = $iv . $encrypted;
+  $payload = base64_encode($combined);
+  return urlencode($payload);
 }
 
 function parseUblInvoice(string $xml): array {
@@ -59,209 +91,212 @@ function parseUblInvoice(string $xml): array {
 
   $xp = new DOMXPath($dom);
 
-  // Namespaces
+  // UBL + HR CIUS namespace-i
   $xp->registerNamespace('ubl', 'urn:oasis:names:specification:ubl:schema:xsd:Invoice-2');
   $xp->registerNamespace('cbc', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
   $xp->registerNamespace('cac', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
   $xp->registerNamespace('ext', 'urn:oasis:names:specification:ubl:schema:xsd:CommonExtensionComponents-2');
   $xp->registerNamespace('hrextac', 'urn:mfin.gov.hr:schema:xsd:HRExtensionAggregateComponents-1');
 
-  $supplierPartyBase   = '/ubl:Invoice/cac:AccountingSupplierParty/cac:Party';
-  $customerPartyBase   = '/ubl:Invoice/cac:AccountingCustomerParty/cac:Party';
-  $supplierAddressBase = $supplierPartyBase . '/cac:PostalAddress';
-  $customerAddressBase = $customerPartyBase . '/cac:PostalAddress';
+  // Imena firmi znaju biti i u RegistrationName / PartyName ovisno o izdavatelju
+  $supplierName =
+    xpValue($xp, '/ubl:Invoice/cac:AccountingSupplierParty/cac:Party/cac:PartyName/cbc:Name')
+    ?: xpValue($xp, '/ubl:Invoice/cac:AccountingSupplierParty/cac:Party/cac:PartyLegalEntity/cbc:RegistrationName');
+
+  $customerName =
+    xpValue($xp, '/ubl:Invoice/cac:AccountingCustomerParty/cac:Party/cac:PartyName/cbc:Name')
+    ?: xpValue($xp, '/ubl:Invoice/cac:AccountingCustomerParty/cac:Party/cac:PartyLegalEntity/cbc:RegistrationName');
+
+  // IBAN / PaymentID
+  $rawIban = xpValue($xp, '/ubl:Invoice/cac:PaymentMeans/cac:PayeeFinancialAccount/cbc:ID');
+  $iban = normalizeIban($rawIban);
+
+  $paymentId = xpValue($xp, '/ubl:Invoice/cac:PaymentMeans/cbc:PaymentID');
+  [$model, $reference] = splitModelReference($paymentId);
+
+  // Totali
+  $currency = xpValue($xp, '/ubl:Invoice/cbc:DocumentCurrencyCode');
+  $gross = xpValue($xp, '/ubl:Invoice/cac:LegalMonetaryTotal/cbc:PayableAmount');
+
+  // PDV (standard + HR extension) - složimo listu subtotal-a
+  $vatSubtotals = [];
+
+  // Standard UBL TaxTotal
+  foreach ($xp->query('/ubl:Invoice/cac:TaxTotal/cac:TaxSubtotal') as $ts) {
+    /** @var DOMElement $ts */
+    $taxable = xpValue($xp, 'cbc:TaxableAmount', $ts);
+    $taxAmt  = xpValue($xp, 'cbc:TaxAmount', $ts);
+    $catId   = xpValue($xp, 'cac:TaxCategory/cbc:ID', $ts);
+    $percent = xpValue($xp, 'cac:TaxCategory/cbc:Percent', $ts);
+    $scheme  = xpValue($xp, 'cac:TaxCategory/cac:TaxScheme/cbc:ID', $ts);
+
+    $vatSubtotals[] = [
+      'source' => 'UBL',
+      'scheme' => $scheme,
+      'category' => $catId,
+      'percent' => $percent,
+      'taxable' => $taxable,
+      'tax' => $taxAmt,
+    ];
+  }
+
+  // HR FISK 2.0 extension (ako postoji)
+  foreach ($xp->query('/ubl:Invoice/ext:UBLExtensions/ext:UBLExtension/ext:ExtensionContent/hrextac:HRFISK20Data/hrextac:HRTaxTotal/hrextac:HRTaxSubtotal') as $ts) {
+    /** @var DOMElement $ts */
+    $taxable = xpValue($xp, 'cbc:TaxableAmount', $ts);
+    $taxAmt  = xpValue($xp, 'cbc:TaxAmount', $ts);
+    $catId   = xpValue($xp, 'hrextac:HRTaxCategory/cbc:ID', $ts);
+    $name    = xpValue($xp, 'hrextac:HRTaxCategory/cbc:Name', $ts);
+    $percent = xpValue($xp, 'hrextac:HRTaxCategory/cbc:Percent', $ts);
+    $scheme  = xpValue($xp, 'hrextac:HRTaxCategory/hrextac:HRTaxScheme/cbc:ID', $ts);
+
+    $vatSubtotals[] = [
+      'source' => 'HR',
+      'scheme' => $scheme,
+      'category' => $catId ?: $name,
+      'percent' => $percent,
+      'taxable' => $taxable,
+      'tax' => $taxAmt,
+    ];
+  }
+
+  // Stavke
+  $lines = [];
+  foreach ($xp->query('/ubl:Invoice/cac:InvoiceLine') as $line) {
+    /** @var DOMElement $line */
+
+    $id = xpValue($xp, 'cbc:ID', $line);
+
+    /** @var DOMNode|null $qtyN */
+    $qtyN = $xp->query('cbc:InvoicedQuantity', $line)->item(0);
+    $qty  = $qtyN ? trim((string)$qtyN->textContent) : '';
+
+    $uom = ($qtyN instanceof DOMElement && $qtyN->hasAttribute('unitCode'))
+      ? $qtyN->getAttribute('unitCode')
+      : '';
+
+    $name  = xpValue($xp, 'cac:Item/cbc:Name', $line);
+    $net   = xpValue($xp, 'cbc:LineExtensionAmount', $line);
+    $price = xpValue($xp, 'cac:Price/cbc:PriceAmount', $line);
+    $taxP  = xpValue($xp, 'cac:Item/cac:ClassifiedTaxCategory/cbc:Percent', $line);
+
+    $lines[] = [
+      'id' => $id,
+      'name' => $name,
+      'qty' => $qty,
+      'uom' => $uom,
+      'price' => $price,
+      'net' => $net,
+      'tax_percent' => $taxP,
+    ];
+  }
 
   $data = [
-    'invoice_id' => xpValue($xp, '/ubl:Invoice/cbc:ID'),
-    'issue_date' => xpValue($xp, '/ubl:Invoice/cbc:IssueDate'),
-    'issue_time' => xpValue($xp, '/ubl:Invoice/cbc:IssueTime'),
-    'due_date'   => xpValue($xp, '/ubl:Invoice/cbc:DueDate'),
-    'currency'   => xpValue($xp, '/ubl:Invoice/cbc:DocumentCurrencyCode'),
-    'note'       => xpValue($xp, '/ubl:Invoice/cbc:Note'),
+    'invoice_id'   => xpValue($xp, '/ubl:Invoice/cbc:ID'),
+    'issue_date'   => xpValue($xp, '/ubl:Invoice/cbc:IssueDate'),
+    'issue_time'   => xpValue($xp, '/ubl:Invoice/cbc:IssueTime'),
+    'due_date'     => xpValue($xp, '/ubl:Invoice/cbc:DueDate'),
+    'currency'     => $currency,
+    'note'         => xpValue($xp, '/ubl:Invoice/cbc:Note'),
 
     'supplier' => [
-      'name'        => partyNameFromBase($xp, $supplierPartyBase),
-      'oib'         => xpValue($xp, $supplierPartyBase . '/cac:PartyLegalEntity/cbc:CompanyID'),
-      'vat'         => xpValue($xp, $supplierPartyBase . '/cac:PartyTaxScheme/cbc:CompanyID'),
-      'email'       => xpValue($xp, $supplierPartyBase . '/cac:Contact/cbc:ElectronicMail'),
-      'street'      => xpValue($xp, $supplierAddressBase . '/cbc:StreetName'),
-      'building'    => xpValue($xp, $supplierAddressBase . '/cbc:BuildingNumber'),
-      'city'        => xpValue($xp, $supplierAddressBase . '/cbc:CityName'),
-      'postal'      => xpValue($xp, $supplierAddressBase . '/cbc:PostalZone'),
-      'country'     => xpValue($xp, $supplierAddressBase . '/cac:Country/cbc:IdentificationCode'),
-      'subdivision' => xpValue($xp, $supplierAddressBase . '/cbc:CountrySubentity'),
-      'line'        => xpValue($xp, $supplierAddressBase . '/cac:AddressLine/cbc:Line'),
+      'name'   => $supplierName,
+      'oib'    => xpValue($xp, '/ubl:Invoice/cac:AccountingSupplierParty/cac:Party/cac:PartyLegalEntity/cbc:CompanyID'),
+      'vat'    => xpValue($xp, '/ubl:Invoice/cac:AccountingSupplierParty/cac:Party/cac:PartyTaxScheme/cbc:CompanyID'),
+      'email'  => xpValue($xp, '/ubl:Invoice/cac:AccountingSupplierParty/cac:Party/cac:Contact/cbc:ElectronicMail'),
+      'zip'    => xpValue($xp, '/ubl:Invoice/cac:AccountingSupplierParty/cac:Party/cac:PostalAddress/cbc:PostalZone'),
+      'street' => xpValue($xp, '/ubl:Invoice/cac:AccountingSupplierParty/cac:Party/cac:PostalAddress/cbc:StreetName'),
+      'city'   => xpValue($xp, '/ubl:Invoice/cac:AccountingSupplierParty/cac:Party/cac:PostalAddress/cbc:CityName'),
+      'addrLine' => xpValue($xp, '/ubl:Invoice/cac:AccountingSupplierParty/cac:Party/cac:PostalAddress/cac:AddressLine/cbc:Line'),
     ],
 
     'customer' => [
-      'name'        => partyNameFromBase($xp, $customerPartyBase),
-      'oib'         => xpValue($xp, $customerPartyBase . '/cac:PartyLegalEntity/cbc:CompanyID'),
-      'vat'         => xpValue($xp, $customerPartyBase . '/cac:PartyTaxScheme/cbc:CompanyID'),
-      'email'       => xpValue($xp, $customerPartyBase . '/cac:Contact/cbc:ElectronicMail'),
-      'street'      => xpValue($xp, $customerAddressBase . '/cbc:StreetName'),
-      'building'    => xpValue($xp, $customerAddressBase . '/cbc:BuildingNumber'),
-      'city'        => xpValue($xp, $customerAddressBase . '/cbc:CityName'),
-      'postal'      => xpValue($xp, $customerAddressBase . '/cbc:PostalZone'),
-      'country'     => xpValue($xp, $customerAddressBase . '/cac:Country/cbc:IdentificationCode'),
-      'subdivision' => xpValue($xp, $customerAddressBase . '/cbc:CountrySubentity'),
-      'line'        => xpValue($xp, $customerAddressBase . '/cac:AddressLine/cbc:Line'),
+      'name'  => $customerName,
+      'oib'   => xpValue($xp, '/ubl:Invoice/cac:AccountingCustomerParty/cac:Party/cac:PartyLegalEntity/cbc:CompanyID'),
+      'vat'   => xpValue($xp, '/ubl:Invoice/cac:AccountingCustomerParty/cac:Party/cac:PartyTaxScheme/cbc:CompanyID'),
+      'email' => xpValue($xp, '/ubl:Invoice/cac:AccountingCustomerParty/cac:Party/cac:Contact/cbc:ElectronicMail'),
+      'zip'   => xpValue($xp, '/ubl:Invoice/cac:AccountingCustomerParty/cac:Party/cac:PostalAddress/cbc:PostalZone'),
+      'street'=> xpValue($xp, '/ubl:Invoice/cac:AccountingCustomerParty/cac:Party/cac:PostalAddress/cbc:StreetName'),
+      'city'  => xpValue($xp, '/ubl:Invoice/cac:AccountingCustomerParty/cac:Party/cac:PostalAddress/cbc:CityName'),
+      'addrLine' => xpValue($xp, '/ubl:Invoice/cac:AccountingCustomerParty/cac:Party/cac:PostalAddress/cac:AddressLine/cbc:Line'),
     ],
 
     'totals' => [
       'net'   => xpValue($xp, '/ubl:Invoice/cac:LegalMonetaryTotal/cbc:TaxExclusiveAmount'),
       'vat'   => xpValue($xp, '/ubl:Invoice/cac:TaxTotal/cbc:TaxAmount'),
-      'gross' => xpValue($xp, '/ubl:Invoice/cac:LegalMonetaryTotal/cbc:PayableAmount'),
+      'gross' => $gross,
     ],
 
     'payment' => [
       'means_code' => xpValue($xp, '/ubl:Invoice/cac:PaymentMeans/cbc:PaymentMeansCode'),
       'note'       => xpValue($xp, '/ubl:Invoice/cac:PaymentMeans/cbc:InstructionNote'),
-      'payment_id' => xpValue($xp, '/ubl:Invoice/cac:PaymentMeans/cbc:PaymentID'),
-      'iban_raw'   => xpValue($xp, '/ubl:Invoice/cac:PaymentMeans/cac:PayeeFinancialAccount/cbc:ID'),
-      'iban'       => '',
+      'payment_id' => $paymentId,
+      'model'      => $model,
+      'reference'  => $reference,
+      'iban_raw'   => $rawIban,
+      'iban'       => $iban,
     ],
 
-    'tax_breakdown' => [],
-    'lines' => [],
-
-    'attachment_pdf' => [
-      'filename' => '',
-      'mime'     => '',
-      'b64'      => '',
-      'size'     => 0,
-    ],
+    'vat_subtotals' => $vatSubtotals,
+    'lines' => $lines,
   ];
-
-  $data['payment']['iban'] = normalizeIban($data['payment']['iban_raw']);
-
-  // Lines
-  foreach ($xp->query('/ubl:Invoice/cac:InvoiceLine') as $line) {
-   /** @var DOMElement|null $qtyN */
-$qtyN = $xp->query('cbc:InvoicedQuantity', $line)->item(0);
-
-$qty = ($qtyN instanceof DOMElement)
-  ? trim($qtyN->textContent)
-  : '';
-
-$uom = ($qtyN instanceof DOMElement && $qtyN->hasAttribute('unitCode'))
-  ? $qtyN->getAttribute('unitCode')
-  : '';
-
-
-    $data['lines'][] = [
-      'id'          => xpValueCtx($xp, 'cbc:ID', $line),
-      'name'        => xpValueCtx($xp, 'cac:Item/cbc:Name', $line),
-      'qty'         => $qty,
-      'uom'         => $uom,
-      'price'       => xpValueCtx($xp, 'cac:Price/cbc:PriceAmount', $line),
-      'net'         => xpValueCtx($xp, 'cbc:LineExtensionAmount', $line),
-      'tax_percent' => xpValueCtx($xp, 'cac:Item/cac:ClassifiedTaxCategory/cbc:Percent', $line),
-    ];
-  }
-
-  // TAX BREAKDOWN (prefer HRFISK20 if present, else fallback to UBL)
-  $taxRows = [];
-
-  foreach ($xp->query('/ubl:Invoice/ext:UBLExtensions/ext:UBLExtension/ext:ExtensionContent/hrextac:HRFISK20Data/hrextac:HRTaxTotal/hrextac:HRTaxSubtotal') as $sub) {
-    /** @var DOMElement $sub */
-    $taxRows[] = [
-      'source'  => 'HRFISK20',
-      'cat_id'  => xpValueCtx($xp, 'hrextac:HRTaxCategory/cbc:ID', $sub),
-      'cat'     => xpValueCtx($xp, 'hrextac:HRTaxCategory/cbc:Name', $sub),
-      'percent' => xpValueCtx($xp, 'hrextac:HRTaxCategory/cbc:Percent', $sub),
-      'taxable' => xpValueCtx($xp, 'cbc:TaxableAmount', $sub),
-      'tax'     => xpValueCtx($xp, 'cbc:TaxAmount', $sub),
-    ];
-  }
-
-  if (count($taxRows) === 0) {
-    foreach ($xp->query('/ubl:Invoice/cac:TaxTotal/cac:TaxSubtotal') as $sub) {
-      /** @var DOMElement $sub */
-      $taxRows[] = [
-        'source'  => 'UBL',
-        'cat_id'  => xpValueCtx($xp, 'cac:TaxCategory/cbc:ID', $sub),
-        'cat'     => '',
-        'percent' => xpValueCtx($xp, 'cac:TaxCategory/cbc:Percent', $sub),
-        'taxable' => xpValueCtx($xp, 'cbc:TaxableAmount', $sub),
-        'tax'     => xpValueCtx($xp, 'cbc:TaxAmount', $sub),
-      ];
-    }
-  }
-
-  $data['tax_breakdown'] = $taxRows;
-
-  // Embedded PDF attachment (if present)
-  $attNode = $xp->query('/ubl:Invoice/cac:AdditionalDocumentReference/cac:Attachment/cbc:EmbeddedDocumentBinaryObject')->item(0);
-  if ($attNode) {
-    $data['attachment_pdf']['b64'] = trim($attNode->textContent);
-    $data['attachment_pdf']['mime'] = ($attNode->attributes && $attNode->attributes->getNamedItem('mimeCode'))
-      ? $attNode->attributes->getNamedItem('mimeCode')->nodeValue
-      : '';
-    $data['attachment_pdf']['filename'] = ($attNode->attributes && $attNode->attributes->getNamedItem('filename'))
-      ? $attNode->attributes->getNamedItem('filename')->nodeValue
-      : 'racun.pdf';
-
-    $b64 = $data['attachment_pdf']['b64'];
-    if ($b64 !== '') {
-      $pad = 0;
-      if (substr($b64, -2) === '==') $pad = 2;
-      elseif (substr($b64, -1) === '=') $pad = 1;
-      $data['attachment_pdf']['size'] = (int) floor((strlen($b64) * 3) / 4) - $pad;
-    }
-  }
 
   return $data;
 }
 
 $parsed = null;
 $error = null;
-$xmlPayload = null;
+$barcodeUrl = '';
+$barcodePayload = '';
 
-// POST handling
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   try {
-    // A) Download PDF mode
-    if (isset($_POST['download_pdf']) && isset($_POST['xml_payload'])) {
-      $xml = base64_decode((string)$_POST['xml_payload'], true);
-      if ($xml === false || trim($xml) === '') {
-        throw new RuntimeException('Invalid XML payload.');
-      }
-
-      $tmp = parseUblInvoice($xml);
-      $b64 = $tmp['attachment_pdf']['b64'] ?? '';
-      if ($b64 === '') throw new RuntimeException('PDF nije pronađen u XML-u.');
-
-      $pdf = base64_decode($b64, true);
-      if ($pdf === false) throw new RuntimeException('Neispravan Base64 PDF.');
-
-      if (strncmp($pdf, "%PDF", 4) !== 0) throw new RuntimeException('Attachment nije PDF (ne počinje s %PDF).');
-
-      $fn = $tmp['attachment_pdf']['filename'] ?: ('racun_' . ($tmp['invoice_id'] ?: 'download') . '.pdf');
-      $fn = preg_replace('/[^A-Za-z0-9._-]+/', '_', $fn);
-
-      header('Content-Type: application/pdf');
-      header('Content-Disposition: attachment; filename="' . $fn . '"');
-      header('Content-Length: ' . strlen($pdf));
-      echo $pdf;
-      exit;
-    }
-
-    // B) Normal upload mode
     if (!isset($_FILES['xml']) || $_FILES['xml']['error'] !== UPLOAD_ERR_OK) {
       throw new RuntimeException('Upload failed.');
     }
-
-    if (!empty($_FILES['xml']['size']) && $_FILES['xml']['size'] > 5 * 1024 * 1024) {
-      throw new RuntimeException('File too large (max 5 MB).');
-    }
-
     $xml = file_get_contents($_FILES['xml']['tmp_name']);
     if ($xml === false || trim($xml) === '') {
       throw new RuntimeException('Empty file.');
     }
 
     $parsed = parseUblInvoice($xml);
-    $xmlPayload = base64_encode($xml);
+
+    // --- 2D barcode payload ---
+    // 1) postal nebitan, bitan zip -> city = zip
+    // 2) payer = kupac, payee = dobavljač
+    $payerZip = $parsed['customer']['zip'] ?: '';
+    $payeeZip = $parsed['supplier']['zip'] ?: '';
+
+    $descriptionParts = [];
+    if (!empty($parsed['invoice_id'])) $descriptionParts[] = 'Račun ' . $parsed['invoice_id'];
+    if (!empty($parsed['note'])) $descriptionParts[] = $parsed['note'];
+    $description = trim(implode(' | ', $descriptionParts));
+
+    $code = 'COST'; // ako nemaš posebni kod, ovo je fallback
+
+    $payloadData = [
+      'payer' => [
+        'name' => (string)($parsed['customer']['name'] ?? ''),
+        'address' => (string)($parsed['customer']['street'] ?: $parsed['customer']['addrLine'] ?: ''),
+        'city' => (string)$payerZip, // <- samo ZIP po tvojoj želji
+      ],
+      'payee' => [
+        'name' => (string)($parsed['supplier']['name'] ?? ''),
+        'address' => (string)($parsed['supplier']['street'] ?: $parsed['supplier']['addrLine'] ?: ''),
+        'city' => (string)$payeeZip, // <- samo ZIP
+      ],
+      'iban' => (string)($parsed['payment']['iban'] ?? ''),
+      'currency' => (string)($parsed['currency'] ?? ''),
+      //'amount' => (string)($parsed['totals']['gross'] ?? ''),
+      'amount' => preg_replace('/[^\d]/', '', number_format((float)($parsed['totals']['gross'] ?? 0), 2, '.', '')),
+      'model' => (string)($parsed['payment']['model'] ?? ''),
+      'reference' => (string)($parsed['payment']['reference'] ?? ''),
+      'code' => $code,
+      'description' => $description,
+    ];
+
+    $barcodePayload = encryptPayload($payloadData, ENCRYPTION_KEY);
+    $barcodeUrl = BARCODE_ENDPOINT . $barcodePayload;
 
   } catch (Throwable $e) {
     $error = $e->getMessage();
@@ -284,10 +319,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     .err{background:#ffecec;border:1px solid #ffb3b3}
     .ok{background:#f6fffa;border:1px solid #b7f5d0}
     code{background:#f5f5f5;padding:2px 6px;border-radius:6px}
-    .copy-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-    .copy-btn{border:1px solid #ccc;border-radius:10px;padding:6px 10px;background:#fff;cursor:pointer}
-    .copy-btn:hover{background:#fafafa}
-    .pill{display:inline-block;border:1px solid #ddd;border-radius:999px;padding:2px 8px;font-size:12px;background:#fafafa}
+    .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+    button{cursor:pointer}
+    .btn{padding:8px 12px;border:1px solid #ccc;border-radius:10px;background:#fff}
+    .btn.primary{border-color:#2b7; background:#f6fffa}
+    .btn.danger{border-color:#f99; background:#fff5f5}
+    .field{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    input.readonly{padding:6px 10px;border:1px solid #ddd;border-radius:10px;min-width:280px}
+    img.barcode{max-width:450px;width:100%;height:auto;border:1px solid #eee;border-radius:12px}
   </style>
 </head>
 <body>
@@ -295,12 +334,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   <h1>UBL 2.1 (HR CIUS 2025) XML → Human readable</h1>
 
   <div class="card">
-    <form method="post" enctype="multipart/form-data">
-      <label><b>Upload UBL 2.1 XML:</b></label><br>
-      <input type="file" name="xml" accept=".xml,text/xml,application/xml" required>
-      <button type="submit">Prikaži</button>
+    <form method="post" enctype="multipart/form-data" class="row">
+      <div>
+        <label><b>Upload UBL XML:</b></label><br>
+        <input type="file" name="xml" accept=".xml,text/xml,application/xml" required>
+      </div>
+      <div>
+        <button class="btn primary" type="submit">Prikaži</button>
+      </div>
     </form>
-    <p class="muted">Preglednik: dobavljač/kupac, adrese, iznosi, PDV razrada, plaćanje, stavke, PDF prilog.</p>
+    <p class="muted">Preglednik: dobavljač/kupac, iznosi, stavke + 2D barcode za plaćanje.</p>
   </div>
 
   <?php if ($error): ?>
@@ -325,137 +368,69 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       </div>
     </div>
 
-    <?php
-      $s = $parsed['supplier'];
-      $sStreetFull = trim(($s['street'] ?? '') . (empty($s['building']) ? '' : ' ' . $s['building']));
-      $sCityLine   = trim(($s['postal'] ?? '') . ' ' . ($s['city'] ?? ''));
-      $sCountry    = $s['country'] ?? '';
-      $sLineFallback = $s['line'] ?? '';
-
-      $c = $parsed['customer'];
-      $cStreetFull = trim(($c['street'] ?? '') . (empty($c['building']) ? '' : ' ' . $c['building']));
-      $cCityLine   = trim(($c['postal'] ?? '') . ' ' . ($c['city'] ?? ''));
-      $cCountry    = $c['country'] ?? '';
-      $cLineFallback = $c['line'] ?? '';
-    ?>
-
     <div class="card">
       <h3>Dobavljač</h3>
-      <div><b><?=h($s['name'])?></b></div>
-      <div class="muted">OIB: <?=h($s['oib'])?> | VAT: <?=h($s['vat'])?></div>
-
-      <?php if ($sStreetFull !== ''): ?>
-        <div><?=h($sStreetFull)?></div>
-      <?php elseif ($sLineFallback !== ''): ?>
-        <div><?=h($sLineFallback)?></div>
-      <?php endif; ?>
-
-      <div class="muted">
-        <?php if ($sCityLine !== ''): ?><?=h($sCityLine)?><?php endif; ?>
-        <?php if (!empty($s['subdivision'])): ?> · <?=h($s['subdivision'])?><?php endif; ?>
-        <?php if ($sCountry !== ''): ?> · <?=h($sCountry)?><?php endif; ?>
-      </div>
-
-      <?php if (!empty($s['email'])): ?><div>Email: <?=h($s['email'])?></div><?php endif; ?>
+      <div><b><?=h($parsed['supplier']['name'])?></b></div>
+      <div class="muted">OIB: <?=h($parsed['supplier']['oib'])?> | VAT: <?=h($parsed['supplier']['vat'])?></div>
+      <div><?=h($parsed['supplier']['street'])?><?= $parsed['supplier']['city'] ? ', ' . h($parsed['supplier']['city']) : '' ?></div>
+      <?php if ($parsed['supplier']['email']): ?><div>Email: <?=h($parsed['supplier']['email'])?></div><?php endif; ?>
     </div>
 
     <div class="card">
       <h3>Kupac</h3>
-      <div><b><?=h($c['name'])?></b></div>
-      <div class="muted">OIB: <?=h($c['oib'])?> | VAT: <?=h($c['vat'])?></div>
-
-      <?php if ($cStreetFull !== ''): ?>
-        <div><?=h($cStreetFull)?></div>
-      <?php elseif ($cLineFallback !== ''): ?>
-        <div><?=h($cLineFallback)?></div>
-      <?php endif; ?>
-
-      <div class="muted">
-        <?php if ($cCityLine !== ''): ?><?=h($cCityLine)?><?php endif; ?>
-        <?php if (!empty($c['subdivision'])): ?> · <?=h($c['subdivision'])?><?php endif; ?>
-        <?php if ($cCountry !== ''): ?> · <?=h($cCountry)?><?php endif; ?>
-      </div>
-
-      <?php if (!empty($c['email'])): ?><div>Email: <?=h($c['email'])?></div><?php endif; ?>
+      <div><b><?=h($parsed['customer']['name'])?></b></div>
+      <div class="muted">OIB: <?=h($parsed['customer']['oib'])?> | VAT: <?=h($parsed['customer']['vat'])?></div>
+      <?php if ($parsed['customer']['email']): ?><div>Email: <?=h($parsed['customer']['email'])?></div><?php endif; ?>
     </div>
 
-    <?php if (!empty($parsed['tax_breakdown'])): ?>
+    <div class="card">
+      <h3>Plaćanje</h3>
+      <div><b>PaymentMeansCode:</b> <code><?=h($parsed['payment']['means_code'])?></code></div>
+      <div><b>Uputa:</b> <?=h($parsed['payment']['note'])?></div>
+      <div><b>Poziv/PaymentID:</b> <?=h($parsed['payment']['payment_id'])?></div>
+
+      <div class="field" style="margin-top:10px">
+        <b>IBAN:</b>
+        <input class="readonly" id="iban" type="text" readonly value="<?=h($parsed['payment']['iban'])?>">
+        <button class="btn" type="button" onclick="copyText('iban')">Copy</button>
+        <span class="muted">(normalizirano, bez razmaka)</span>
+      </div>
+
+      <?php if (!empty($parsed['payment']['model']) || !empty($parsed['payment']['reference'])): ?>
+        <div style="margin-top:8px">
+          <b>Model:</b> <code><?=h($parsed['payment']['model'])?></code>
+          &nbsp; <b>Poziv na broj:</b> <code><?=h($parsed['payment']['reference'])?></code>
+        </div>
+      <?php endif; ?>
+    </div>
+
+    <?php if (!empty($parsed['vat_subtotals'])): ?>
       <div class="card">
-        <h3>PDV razrada</h3>
+        <h3>PDV (subtotal)</h3>
         <table>
           <thead>
             <tr>
               <th>Izvor</th>
+              <th>Shema</th>
               <th>Kategorija</th>
-              <th>Stopa</th>
+              <th>Stopa %</th>
               <th>Osnovica</th>
               <th>PDV</th>
             </tr>
           </thead>
           <tbody>
-            <?php foreach ($parsed['tax_breakdown'] as $t): ?>
+            <?php foreach ($parsed['vat_subtotals'] as $v): ?>
               <tr>
-                <td><span class="muted"><?=h($t['source'])?></span></td>
-                <td>
-                  <?=h($t['cat_id'])?>
-                  <?php if (!empty($t['cat'])): ?>
-                    <span class="muted">— <?=h($t['cat'])?></span>
-                  <?php endif; ?>
-                </td>
-                <td><?=h($t['percent'])?>%</td>
-                <td><?=h($t['taxable'])?> <?=h($parsed['currency'])?></td>
-                <td><?=h($t['tax'])?> <?=h($parsed['currency'])?></td>
+                <td><?=h($v['source'])?></td>
+                <td><?=h($v['scheme'])?></td>
+                <td><?=h($v['category'])?></td>
+                <td><?=h($v['percent'])?></td>
+                <td><?=h($v['taxable'])?> <?=h($parsed['currency'])?></td>
+                <td><?=h($v['tax'])?> <?=h($parsed['currency'])?></td>
               </tr>
             <?php endforeach; ?>
           </tbody>
         </table>
-      </div>
-    <?php endif; ?>
-
-    <div class="card">
-      <h3>Plaćanje</h3>
-
-      <div class="copy-row">
-        <div><b>PaymentMeansCode:</b> <code><?=h($parsed['payment']['means_code'])?></code></div>
-        <?php if (!empty($parsed['payment']['note'])): ?>
-          <span class="pill"><?=h($parsed['payment']['note'])?></span>
-        <?php endif; ?>
-      </div>
-
-      <?php if (!empty($parsed['payment']['payment_id'])): ?>
-        <div class="copy-row" style="margin-top:10px">
-          <div><b>Poziv/PaymentID:</b> <code id="payid"><?=h($parsed['payment']['payment_id'])?></code></div>
-          <button class="copy-btn" type="button" data-copy-target="payid">Copy</button>
-        </div>
-      <?php endif; ?>
-
-      <?php if (!empty($parsed['payment']['iban'])): ?>
-        <div class="copy-row" style="margin-top:10px">
-          <div><b>IBAN (normalizirano):</b> <code id="iban"><?=h($parsed['payment']['iban'])?></code></div>
-          <button class="copy-btn" type="button" data-copy-target="iban">Copy</button>
-        </div>
-        <?php if (!empty($parsed['payment']['iban_raw']) && $parsed['payment']['iban_raw'] !== $parsed['payment']['iban']): ?>
-          <div class="muted" style="margin-top:6px">
-            Original: <code><?=h($parsed['payment']['iban_raw'])?></code>
-          </div>
-        <?php endif; ?>
-      <?php endif; ?>
-    </div>
-
-    <?php if (!empty($parsed['attachment_pdf']['b64']) && !empty($xmlPayload)): ?>
-      <div class="card">
-        <h3>PDF prilog</h3>
-        <div class="muted">
-          <?=h($parsed['attachment_pdf']['filename'] ?: 'racun.pdf')?>
-          <?php if (!empty($parsed['attachment_pdf']['mime'])): ?> · <?=h($parsed['attachment_pdf']['mime'])?><?php endif; ?>
-          <?php if (!empty($parsed['attachment_pdf']['size'])): ?> · <?=h((string)round($parsed['attachment_pdf']['size']/1024))?> KB<?php endif; ?>
-        </div>
-
-        <form method="post" style="margin-top:10px">
-          <input type="hidden" name="download_pdf" value="1">
-          <input type="hidden" name="xml_payload" value="<?=h($xmlPayload)?>">
-          <button class="copy-btn" type="submit">Preuzmi PDF</button>
-        </form>
       </div>
     <?php endif; ?>
 
@@ -480,59 +455,102 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
               <td><?=h($l['qty'])?> <span class="muted"><?=h($l['uom'])?></span></td>
               <td><?=h($l['price'])?> <?=h($parsed['currency'])?></td>
               <td><?=h($l['net'])?> <?=h($parsed['currency'])?></td>
-              <td><?=h($l['tax_percent'])?>%</td>
+              <td><?=h($l['tax_percent'])?></td>
             </tr>
           <?php endforeach; ?>
         </tbody>
       </table>
     </div>
+
+    <div class="card">
+      <h3>2D barcode za plaćanje</h3>
+
+      <?php if ($barcodeUrl): ?>
+        <div class="row" style="align-items:flex-start">
+          <div style="max-width:480px">
+            <img class="barcode" id="barcodeImg" src="<?=h($barcodeUrl)?>" alt="2D barcode za plaćanje">
+            <div class="row" style="margin-top:10px">
+              <button class="btn primary" type="button" onclick="downloadBarcode()">Preuzmi sliku</button>
+            </div>
+            <div class="muted" style="margin-top:8px">
+              Naziv datoteke: <code id="fnamePreview"></code>
+            </div>
+          </div>
+          <div class="muted" style="flex:1;min-width:260px">
+            <div><b>Payee:</b> <?=h($parsed['supplier']['name'])?></div>
+            <div><b>Iznos:</b> <?=h($parsed['totals']['gross'])?> <?=h($parsed['currency'])?></div>
+            <div><b>IBAN:</b> <?=h($parsed['payment']['iban'])?></div>
+            <?php if (!empty($parsed['payment']['model']) || !empty($parsed['payment']['reference'])): ?>
+              <div><b>Model/Poziv:</b> <?=h($parsed['payment']['model'])?> <?=h($parsed['payment']['reference'])?></div>
+            <?php endif; ?>
+          </div>
+        </div>
+      <?php else: ?>
+        <div class="muted">Barcode nije generiran (provjeri ENCRYPTION_KEY i openssl).</div>
+      <?php endif; ?>
+    </div>
+
   <?php endif; ?>
 
 <script>
-(function () {
-  async function copyText(text) {
-    if (navigator.clipboard && window.isSecureContext) {
-      await navigator.clipboard.writeText(text);
-      return true;
-    }
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    ta.style.position = 'fixed';
-    ta.style.left = '-9999px';
-    document.body.appendChild(ta);
-    ta.focus();
-    ta.select();
-    const ok = document.execCommand('copy');
-    document.body.removeChild(ta);
-    return ok;
-  }
-
-  function flash(btn, msg) {
-    const old = btn.textContent;
-    btn.textContent = msg;
-    btn.disabled = true;
-    setTimeout(() => { btn.textContent = old; btn.disabled = false; }, 900);
-  }
-
-  document.addEventListener('click', async (e) => {
-    const btn = e.target.closest('button[data-copy-target]');
-    if (!btn) return;
-
-    const id = btn.getAttribute('data-copy-target');
-    const el = document.getElementById(id);
-    if (!el) return;
-
-    const text = (el.textContent || '').trim();
-    if (!text) return;
-
-    try {
-      const ok = await copyText(text);
-      flash(btn, ok ? 'Copied!' : 'Copy?');
-    } catch {
-      flash(btn, 'Nope');
-    }
+function copyText(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.select?.();
+  el.setSelectionRange?.(0, 99999);
+  navigator.clipboard.writeText(el.value).catch(() => {
+    // fallback
+    try { document.execCommand('copy'); } catch(e) {}
   });
+}
+
+function pad(n){ return String(n).padStart(2,'0'); }
+
+function makeFilename() {
+  const d = new Date();
+  // YYYYMMDDHHMMSS
+  const name =
+    d.getFullYear() +
+    pad(d.getMonth()+1) +
+    pad(d.getDate()) +
+    pad(d.getHours()) +
+    pad(d.getMinutes()) +
+    pad(d.getSeconds()) +
+    '.png';
+  return name;
+}
+
+(function initFilenamePreview(){
+  const el = document.getElementById('fnamePreview');
+  if (el) el.textContent = makeFilename();
 })();
+
+async function downloadBarcode() {
+  const img = document.getElementById('barcodeImg');
+  if (!img || !img.src) return;
+
+  const filename = makeFilename();
+  const preview = document.getElementById('fnamePreview');
+  if (preview) preview.textContent = filename;
+
+  // fetch image as blob and download
+  const resp = await fetch(img.src, { cache: 'no-store' });
+  if (!resp.ok) {
+    alert('Ne mogu preuzeti sliku (fetch failed).');
+    return;
+  }
+  const blob = await resp.blob();
+  const url = URL.createObjectURL(blob);
+
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+
+  URL.revokeObjectURL(url);
+}
 </script>
 
 </body>
