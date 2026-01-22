@@ -725,7 +725,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     </div>
     <?php if (!empty($parsed['vat_subtotals'])): ?>
       <div class="card">
-        <h3>PDV (subtotal)</h3>
+        <h3>Total</h3>
         <table>
           <thead>
             <tr>
@@ -747,7 +747,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
               $total   = $taxable + $tax;
 
               // format kao HR (zarez decimale)
-              $totalFmt = number_format($total, 2, ',', '');
+              $totalFmt = number_format($total, 2, '.', '');
               ?>
               <tr>
                 <td><?= h($v['source']) ?></td>
