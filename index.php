@@ -2,15 +2,26 @@
 //
 // 1.0.0 - Inicialna verzija
 // 1.0.1 - Dodani 2D barcode HUB3 za brže plaćanje putem aplikacije
+// 1.0.2 - Dodano preuzimanje PDF-a ako ima embedano u XML-u + sigurnosne provjere
+// 1.0.3 - Poboljšana validacija IBAN-a i PaymentID-a
+// 1.0.4 - Dodana provjera MIME tipa uploadanog file-a (finfo ili ekstenzija)
+// 1.0.5 - Dodana provjera veličine uploadanog file-a (max 5 MB)
+// 1.0.6 - Poboljšano rukovanje greškama kod XML parsiranja
+//
 // UBL 2.1 (HR CIUS 2025) XML → Human readable
-// Vibe code by ChatGPT by Dalibor Klobučarić 
-// and ChatGPT
+// Vibe code by ChatGPT and Dalibor Klobučarić 
 // 
-
 declare(strict_types=1);
 
-const ENCRYPTION_KEY = '12345678901234567890123456789012'; // <- 32 chars (AES-256 key)
+const ENCRYPTION_KEY = '12345678901234567890123456789012'; // <- 32 chars (AES-256 key) (dummy)
 const BARCODE_ENDPOINT = 'https://hub3.dd-lab.hr/?data=';
+const PAYMENT_MEANS_HR = [
+  '30' => 'Uplata / kreditni transfer (virman)',
+  '42' => 'Plaćanje na bankovni račun',
+  '10' => 'Gotovina',
+  '48' => 'Kartično plaćanje',
+  '49' => 'Izravno terećenje (direct debit)',
+];
 
 function h(string $s): string {
   return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
@@ -22,28 +33,79 @@ function xpValue(DOMXPath $xp, string $q, ?DOMNode $ctx = null): string {
 }
 
 function normalizeIban(string $iban): string {
-  // makni razmake i sve što nije slovo/broj
   $iban = preg_replace('/\s+/', '', $iban) ?? $iban;
   $iban = preg_replace('/[^A-Za-z0-9]/', '', $iban) ?? $iban;
   return strtoupper($iban);
 }
 
 function splitModelReference(string $paymentId): array {
-  // Primjeri iz prakse:
-  // "HR05 37567-261-015"
-  // "HR05 123-456-789"
+  // "HR05 123-456" → ["HR05", "123-456"]
+  // "HR99 123-456" → ["HR00", "0000"]
+  // "HR99" → ["HR00", "0000"]
+  // "HR05" → ["HR00", "0000"] (jer nema reference)
+  // "" → ["HR00", "0000"]
+  // "neki trash" → ["HR00", "0000"]
+
   $s = trim($paymentId);
   $s = preg_replace('/\s+/', ' ', $s) ?? $s;
 
-  // uhvati "HR" + 2 znamenke (s ili bez razmaka) + ostatak
+  $fallback = ['HR00', '0000'];
+
+  if ($s === '') return $fallback;
+
+  // HRxx + referenca
   if (preg_match('/^(HR\s?\d{2})\s+(.*)$/i', $s, $m)) {
-    $model = strtoupper(str_replace(' ', '', $m[1])); // HR05
+    $model = strtoupper(str_replace(' ', '', $m[1]));
     $ref   = trim($m[2]);
+
+    if ($model === 'HR99') return $fallback;
+    if ($ref === '') return $fallback;
+
     return [$model, $ref];
   }
 
-  // fallback: ako nema modela
-  return ['', $s];
+  // samo model -> fallback
+  if (preg_match('/^(HR\s?\d{2})$/i', $s)) {
+    return $fallback;
+  }
+
+  return $fallback;
+}
+
+function paymentMeansLabel(string $code): string {
+  $code = trim($code);
+  return PAYMENT_MEANS_HR[$code] ?? 'Nepoznato';
+}
+
+function amountToCents(string $amount): string {
+  $s = trim($amount);
+  if ($s === '') return '0';
+
+  // normaliziraj decimalni separator na točku
+  $s = str_replace([' ', "\u{00A0}"], '', $s); // obični i NBSP razmak
+  $s = str_replace(',', '.', $s);
+
+  // ostavi samo znamenke i točku
+  $s = preg_replace('/[^0-9.]/', '', $s) ?? $s;
+
+  // ako ima više točaka, uzmi zadnju kao decimalnu
+  if (substr_count($s, '.') > 1) {
+    $parts = explode('.', $s);
+    $dec = array_pop($parts);
+    $int = implode('', $parts);
+    $s = $int . '.' . $dec;
+  }
+
+  if (strpos($s, '.') === false) {
+    return ($s === '' ? '0' : $s) . '00';
+  }
+
+  [$int, $dec] = explode('.', $s, 2);
+  $int = $int === '' ? '0' : $int;
+  $dec = substr($dec . '00', 0, 2);
+
+  $cents = ltrim($int . $dec, '0');
+  return $cents === '' ? '0' : $cents;
 }
 
 function encryptPayload(array $data, string $encryptionKey): string {
@@ -74,6 +136,8 @@ function encryptPayload(array $data, string $encryptionKey): string {
 
   $combined = $iv . $encrypted;
   $payload = base64_encode($combined);
+
+  // safe for query string
   return urlencode($payload);
 }
 
@@ -118,10 +182,9 @@ function parseUblInvoice(string $xml): array {
   $currency = xpValue($xp, '/ubl:Invoice/cbc:DocumentCurrencyCode');
   $gross = xpValue($xp, '/ubl:Invoice/cac:LegalMonetaryTotal/cbc:PayableAmount');
 
-  // PDV (standard + HR extension) - složimo listu subtotal-a
+  // PDV (standard + HR extension)
   $vatSubtotals = [];
 
-  // Standard UBL TaxTotal
   foreach ($xp->query('/ubl:Invoice/cac:TaxTotal/cac:TaxSubtotal') as $ts) {
     /** @var DOMElement $ts */
     $taxable = xpValue($xp, 'cbc:TaxableAmount', $ts);
@@ -140,7 +203,6 @@ function parseUblInvoice(string $xml): array {
     ];
   }
 
-  // HR FISK 2.0 extension (ako postoji)
   foreach ($xp->query('/ubl:Invoice/ext:UBLExtensions/ext:UBLExtension/ext:ExtensionContent/hrextac:HRFISK20Data/hrextac:HRTaxTotal/hrextac:HRTaxSubtotal') as $ts) {
     /** @var DOMElement $ts */
     $taxable = xpValue($xp, 'cbc:TaxableAmount', $ts);
@@ -164,7 +226,6 @@ function parseUblInvoice(string $xml): array {
   $lines = [];
   foreach ($xp->query('/ubl:Invoice/cac:InvoiceLine') as $line) {
     /** @var DOMElement $line */
-
     $id = xpValue($xp, 'cbc:ID', $line);
 
     /** @var DOMNode|null $qtyN */
@@ -241,29 +302,138 @@ function parseUblInvoice(string $xml): array {
     'lines' => $lines,
   ];
 
+  // --- Embedded PDF attachment (if present) ---
+  $data['attachment_pdf'] = [
+    'b64' => '',
+    'mime' => '',
+    'filename' => '',
+    'size' => 0,
+  ];
+
+  // Prefer PDF po mimeCode
+  $attNode = $xp->query(
+    '/ubl:Invoice/cac:AdditionalDocumentReference/cac:Attachment/cbc:EmbeddedDocumentBinaryObject[@mimeCode="application/pdf"]'
+  )->item(0);
+
+  // Fallback: prvi attachment
+  if (!$attNode) {
+    $attNode = $xp->query(
+      '/ubl:Invoice/cac:AdditionalDocumentReference/cac:Attachment/cbc:EmbeddedDocumentBinaryObject'
+    )->item(0);
+  }
+
+  if ($attNode instanceof DOMElement) {
+    $b64 = trim($attNode->textContent);
+    $b64 = preg_replace('/\s+/', '', $b64) ?? $b64;
+
+    $mime = $attNode->getAttribute('mimeCode') ?: '';
+    $fn   = $attNode->getAttribute('filename') ?: 'racun.pdf';
+
+    if ($mime === '' && preg_match('/\.pdf$/i', $fn)) {
+      $mime = 'application/pdf';
+    }
+
+    $data['attachment_pdf']['b64'] = $b64;
+    $data['attachment_pdf']['mime'] = $mime;
+    $data['attachment_pdf']['filename'] = $fn;
+
+    if ($b64 !== '') {
+      $pad = 0;
+      if (substr($b64, -2) === '==') $pad = 2;
+      elseif (substr($b64, -1) === '=') $pad = 1;
+      $data['attachment_pdf']['size'] = (int) floor((strlen($b64) * 3) / 4) - $pad;
+    }
+  }
+
   return $data;
 }
 
+// -------------------- Runtime --------------------
 $parsed = null;
 $error = null;
 $barcodeUrl = '';
 $barcodePayload = '';
+$xmlPayload = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   try {
+
+    // A) Download PDF mode (mora biti prvo!)
+    if (isset($_POST['download_pdf'], $_POST['xml_payload'])) {
+      $xml = base64_decode((string)$_POST['xml_payload'], true);
+      if ($xml === false || trim($xml) === '') {
+        throw new RuntimeException('Invalid XML payload.');
+      }
+
+      $tmp = parseUblInvoice($xml);
+      $b64 = $tmp['attachment_pdf']['b64'] ?? '';
+      if ($b64 === '') {
+        throw new RuntimeException('PDF nije pronađen u XML-u.');
+      }
+
+      $b64 = preg_replace('/\s+/', '', $b64) ?? $b64;
+
+      $pdf = base64_decode($b64, true);
+      if ($pdf === false) {
+        throw new RuntimeException('Neispravan Base64 PDF.');
+      }
+
+      if (strncmp($pdf, '%PDF', 4) !== 0) {
+        throw new RuntimeException('Attachment nije PDF (ne počinje s %PDF).');
+      }
+
+      $fn = $tmp['attachment_pdf']['filename'] ?: ('racun_' . ($tmp['invoice_id'] ?: 'download') . '.pdf');
+      $fn = preg_replace('/[^A-Za-z0-9._-]+/', '_', $fn);
+
+      header('Content-Type: application/pdf');
+      header('Content-Disposition: attachment; filename="' . $fn . '"');
+      header('Content-Length: ' . strlen($pdf));
+      echo $pdf;
+      exit;
+    }
+
+    // B) Normal upload mode
     if (!isset($_FILES['xml']) || $_FILES['xml']['error'] !== UPLOAD_ERR_OK) {
       throw new RuntimeException('Upload failed.');
     }
+
+// === File size provjera ===
+$maxSize = 5 * 1024 * 1024; // 5 MB
+if (!empty($_FILES['xml']['size']) && $_FILES['xml']['size'] > $maxSize) {
+  throw new RuntimeException('XML file je prevelik (max 5 MB).');
+}
+
+// === MIME type provjera (finfo) ===
+$allowedMimes = ['text/xml', 'application/xml', 'text/plain'];
+
+$mimeType = '';
+if (class_exists('finfo')) {
+  $fi = new finfo(FILEINFO_MIME_TYPE);
+  $mimeType = (string) $fi->file($_FILES['xml']['tmp_name']);
+}
+
+// Ako finfo nije dostupan ili nije mogao očitati, fallback na ekstenziju
+if ($mimeType === '') {
+  $ext = strtolower(pathinfo((string)($_FILES['xml']['name'] ?? ''), PATHINFO_EXTENSION));
+  if ($ext !== 'xml') {
+    throw new RuntimeException('Neispravan tip datoteke. Potreban je XML file.');
+  }
+} else {
+  if (!in_array($mimeType, $allowedMimes, true)) {
+    throw new RuntimeException('Neispravan tip datoteke. Potreban je XML file.');
+  }
+}
+
+
     $xml = file_get_contents($_FILES['xml']['tmp_name']);
     if ($xml === false || trim($xml) === '') {
       throw new RuntimeException('Empty file.');
     }
 
     $parsed = parseUblInvoice($xml);
+    $xmlPayload = base64_encode($xml);
 
     // --- 2D barcode payload ---
-    // 1) postal nebitan, bitan zip -> city = zip
-    // 2) payer = kupac, payee = dobavljač
     $payerZip = $parsed['customer']['zip'] ?: '';
     $payeeZip = $parsed['supplier']['zip'] ?: '';
 
@@ -272,23 +442,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (!empty($parsed['note'])) $descriptionParts[] = $parsed['note'];
     $description = trim(implode(' | ', $descriptionParts));
 
-    $code = 'COST'; // ako nemaš posebni kod, ovo je fallback
+    $code = 'COST';
 
     $payloadData = [
       'payer' => [
         'name' => (string)($parsed['customer']['name'] ?? ''),
         'address' => (string)($parsed['customer']['street'] ?: $parsed['customer']['addrLine'] ?: ''),
-        'city' => (string)$payerZip, // <- samo ZIP po tvojoj želji
+        'city' => (string)$payerZip,
       ],
       'payee' => [
         'name' => (string)($parsed['supplier']['name'] ?? ''),
         'address' => (string)($parsed['supplier']['street'] ?: $parsed['supplier']['addrLine'] ?: ''),
-        'city' => (string)$payeeZip, // <- samo ZIP
+        'city' => (string)$payeeZip,
       ],
       'iban' => (string)($parsed['payment']['iban'] ?? ''),
       'currency' => (string)($parsed['currency'] ?? ''),
-      //'amount' => (string)($parsed['totals']['gross'] ?? ''),
-      'amount' => preg_replace('/[^\d]/', '', number_format((float)($parsed['totals']['gross'] ?? 0), 2, '.', '')),
+      'amount' => amountToCents((string)($parsed['totals']['gross'] ?? '0')),
       'model' => (string)($parsed['payment']['model'] ?? ''),
       'reference' => (string)($parsed['payment']['reference'] ?? ''),
       'code' => $code,
@@ -343,7 +512,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         <button class="btn primary" type="submit">Prikaži</button>
       </div>
     </form>
-    <p class="muted">Preglednik: dobavljač/kupac, iznosi, stavke + 2D barcode za plaćanje.</p>
+    <p class="muted">Preglednik: dobavljač/kupac, iznosi, stavke, 2D barcode za plaćanje i PDF preuzimanje ako postoji.</p>
   </div>
 
   <?php if ($error): ?>
@@ -385,7 +554,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     <div class="card">
       <h3>Plaćanje</h3>
-      <div><b>PaymentMeansCode:</b> <code><?=h($parsed['payment']['means_code'])?></code></div>
+      <div>
+        <b>PaymentMeansCode:</b>
+        <code><?=h($parsed['payment']['means_code'])?> / <?=h(paymentMeansLabel($parsed['payment']['means_code']))?></code>
+      </div>
+
       <div><b>Uputa:</b> <?=h($parsed['payment']['note'])?></div>
       <div><b>Poziv/PaymentID:</b> <?=h($parsed['payment']['payment_id'])?></div>
 
@@ -490,6 +663,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       <?php endif; ?>
     </div>
 
+    <?php if (!empty($parsed['attachment_pdf']['b64']) && !empty($xmlPayload)): ?>
+      <div class="card">
+        <h3>PDF prilog</h3>
+        <div class="muted">
+          <?=h($parsed['attachment_pdf']['filename'] ?: 'racun.pdf')?>
+          <?php if (!empty($parsed['attachment_pdf']['mime'])): ?> · <?=h($parsed['attachment_pdf']['mime'])?><?php endif; ?>
+          <?php if (!empty($parsed['attachment_pdf']['size'])): ?> · <?=h((string)round($parsed['attachment_pdf']['size']/1024))?> KB<?php endif; ?>
+        </div>
+
+        <form method="post" style="margin-top:10px" class="row">
+          <input type="hidden" name="download_pdf" value="1">
+          <input type="hidden" name="xml_payload" value="<?=h($xmlPayload)?>">
+          <button class="btn primary" type="submit">Preuzmi PDF</button>
+        </form>
+      </div>
+    <?php else: ?>
+      <div class="card">
+        <h3>PDF prilog</h3>
+        <div class="muted">PDF nije pronađen u XML-u.</div>
+      </div>
+    <?php endif; ?>
+
   <?php endif; ?>
 
 <script>
@@ -499,7 +694,6 @@ function copyText(id) {
   el.select?.();
   el.setSelectionRange?.(0, 99999);
   navigator.clipboard.writeText(el.value).catch(() => {
-    // fallback
     try { document.execCommand('copy'); } catch(e) {}
   });
 }
@@ -508,16 +702,15 @@ function pad(n){ return String(n).padStart(2,'0'); }
 
 function makeFilename() {
   const d = new Date();
-  // YYYYMMDDHHMMSS
-  const name =
+  return (
     d.getFullYear() +
     pad(d.getMonth()+1) +
     pad(d.getDate()) +
     pad(d.getHours()) +
     pad(d.getMinutes()) +
     pad(d.getSeconds()) +
-    '.png';
-  return name;
+    '.png'
+  );
 }
 
 (function initFilenamePreview(){
@@ -526,31 +719,37 @@ function makeFilename() {
 })();
 
 async function downloadBarcode() {
-  const img = document.getElementById('barcodeImg');
-  if (!img || !img.src) return;
+  try {
+    const img = document.getElementById('barcodeImg');
+    if (!img || !img.src) {
+      alert('Barcode slika nije pronađena.');
+      return;
+    }
 
-  const filename = makeFilename();
-  const preview = document.getElementById('fnamePreview');
-  if (preview) preview.textContent = filename;
+    const resp = await fetch(img.src, { cache: 'no-store' });
+    if (!resp.ok) {
+      throw new Error('HTTP ' + resp.status);
+    }
 
-  // fetch image as blob and download
-  const resp = await fetch(img.src, { cache: 'no-store' });
-  if (!resp.ok) {
-    alert('Ne mogu preuzeti sliku (fetch failed).');
-    return;
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = makeFilename();
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+
+    URL.revokeObjectURL(url);
+
+  } catch (err) {
+    console.error('Download error:', err);
+    const msg = err instanceof Error ? err.message : String(err);
+    alert('Greška pri preuzimanju slike: ' + msg);
   }
-  const blob = await resp.blob();
-  const url = URL.createObjectURL(blob);
-
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-
-  URL.revokeObjectURL(url);
 }
+
 </script>
 
 </body>
