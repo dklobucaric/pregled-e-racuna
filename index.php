@@ -9,10 +9,38 @@
 // 1.0.6 - Poboljšano rukovanje greškama kod XML parsiranja
 // 1.0.7 - FIX: "Ukupno" više nije PayableAmount nego TaxInclusiveAmount; dodano "Za platiti" i logika za prepaid
 // 1.0.8 - Code cleanup i refaktoriranje
+// 1.0.9 - Dodana CSRF zaštita na forme, session security i security headers
 // UBL 2.1 (HR CIUS 2025) XML → Human readable
 // Vibe code by ChatGPT and Dalibor Klobučarić
 //
 declare(strict_types=1);
+
+// ==================== SECURITY HEADERS ====================
+header("Content-Security-Policy: default-src 'self'; connect-src 'self' https://hub3.dd-lab.hr; img-src 'self' https://hub3.dd-lab.hr data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline';");
+header("X-Content-Type-Options: nosniff");
+header("X-Frame-Options: DENY");
+header("Referrer-Policy: strict-origin-when-cross-origin");
+header("Permissions-Policy: geolocation=(), microphone=(), camera=()");
+
+// === CSRF Protection ===
+session_start();
+
+// Session security 
+if (empty($_SESSION['initiated'])) {
+  session_regenerate_id(true);
+  $_SESSION['initiated'] = true;
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+  if (!hash_equals($_SESSION['csrf'] ?? '', $_POST['csrf'] ?? '')) {
+    http_response_code(403);
+    die('Invalid CSRF token');
+  }
+}
+
+if (!isset($_SESSION['csrf'])) {
+  $_SESSION['csrf'] = bin2hex(random_bytes(32));
+}
 
 const ENCRYPTION_KEY = '12345678901234567890123456789012'; // <- 32 chars (AES-256 key) (dummy)
 const BARCODE_ENDPOINT = 'https://hub3.dd-lab.hr/?data=';
@@ -464,6 +492,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       $barcodeUrl = BARCODE_ENDPOINT . $barcodePayload;
     }
   } catch (Throwable $e) {
+    error_log('UBL Parse Error: ' . $e->getMessage() . ' | File: ' . $e->getFile() . ':' . $e->getLine());
     $error = $e->getMessage();
   }
 }
@@ -597,6 +626,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
   <div class="card">
     <form method="post" enctype="multipart/form-data" class="row">
+      <input type="hidden" name="csrf" value="<?= h($_SESSION['csrf']) ?>">
       <div>
         <label><b>Upload UBL XML:</b></label><br>
         <input type="file" name="xml" accept=".xml,text/xml,application/xml" required>
@@ -813,6 +843,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         </div>
 
         <form method="post" style="margin-top:10px" class="row">
+          <input type="hidden" name="csrf" value="<?= h($_SESSION['csrf']) ?>">
           <input type="hidden" name="download_pdf" value="1">
           <input type="hidden" name="xml_payload" value="<?= h($xmlPayload) ?>">
           <button class="btn primary" type="submit">Preuzmi PDF</button>
