@@ -8,7 +8,7 @@
 // 1.0.5 - Dodana provjera veličine uploadanog file-a (max 5 MB)
 // 1.0.6 - Poboljšano rukovanje greškama kod XML parsiranja
 // 1.0.7 - FIX: "Ukupno" više nije PayableAmount nego TaxInclusiveAmount; dodano "Za platiti" i logika za prepaid
-//
+// 1.0.8 - Code cleanup i refaktoriranje
 // UBL 2.1 (HR CIUS 2025) XML → Human readable
 // Vibe code by ChatGPT and Dalibor Klobučarić
 //
@@ -173,9 +173,17 @@ function parseUblInvoice(string $xml): array
   // --- totals: važno! ---
   $net            = xpValue($xp, '/ubl:Invoice/cac:LegalMonetaryTotal/cbc:TaxExclusiveAmount');
   $vatAmount      = xpValue($xp, '/ubl:Invoice/cac:TaxTotal/cbc:TaxAmount');
-  $taxInclusive   = xpValue($xp, '/ubl:Invoice/cac:LegalMonetaryTotal/cbc:TaxInclusiveAmount'); // ukupno računa
-  $payableAmount  = xpValue($xp, '/ubl:Invoice/cac:LegalMonetaryTotal/cbc:PayableAmount');      // za platiti
-  $prepaidAmount  = xpValue($xp, '/ubl:Invoice/cac:LegalMonetaryTotal/cbc:PrepaidAmount');      // već plaćeno (ako postoji)
+  $taxInclusive = xpValue($xp, '/ubl:Invoice/cac:LegalMonetaryTotal/cbc:TaxInclusiveAmount'); // ukupno računa
+  $prepaid      = xpValue($xp, '/ubl:Invoice/cac:LegalMonetaryTotal/cbc:PrepaidAmount'); // već plaćeno (ako postoji)
+  $payable      = xpValue($xp, '/ubl:Invoice/cac:LegalMonetaryTotal/cbc:PayableAmount'); // za platiti
+
+  if ($taxInclusive === '') {
+    if ($payable !== '' && $prepaid !== '') {
+      $taxInclusive = (string)((float)str_replace(',', '.', $payable) + (float)str_replace(',', '.', $prepaid));
+    } elseif ($payable !== '') {
+      $taxInclusive = $payable;
+    }
+  }
 
   $vatSubtotals = [];
 
@@ -260,9 +268,6 @@ function parseUblInvoice(string $xml): array
     ],
 
     // FIX: gross = TaxInclusiveAmount, payable = PayableAmount
-    $taxInclusive = xpValue($xp, '/ubl:Invoice/cac:LegalMonetaryTotal/cbc:TaxInclusiveAmount'),
-    $prepaid      = xpValue($xp, '/ubl:Invoice/cac:LegalMonetaryTotal/cbc:PrepaidAmount'),
-    $payable      = xpValue($xp, '/ubl:Invoice/cac:LegalMonetaryTotal/cbc:PayableAmount'),
 
     'totals' => [
       'net'           => xpValue($xp, '/ubl:Invoice/cac:LegalMonetaryTotal/cbc:TaxExclusiveAmount'),
@@ -614,8 +619,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       <h2>
         Račun <?= h($parsed['invoice_id']) ?>
         <?php
-        $payable = (float)($parsed['totals']['payable'] ?? 0);
-        $prepaid = (float)($parsed['totals']['prepaid'] ?? 0);
+        $payable = (float) str_replace(',', '.', (string)($parsed['totals']['payable'] ?? '0'));
+        $prepaid = (float) str_replace(',', '.', (string)($parsed['totals']['prepaid'] ?? '0'));
+
         if ($payable <= 0.00001 && $prepaid > 0.00001):
         ?>
           <span class="badge paid">PLAĆENO</span>
@@ -690,36 +696,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       <?php endif; ?>
     </div>
 
-    <?php if (!empty($parsed['vat_subtotals'])): ?>
-      <div class="card">
-        <h3>PDV (subtotal)</h3>
-        <table>
-          <thead>
-            <tr>
-              <th>Izvor</th>
-              <th>Shema</th>
-              <th>Kategorija</th>
-              <th>Stopa %</th>
-              <th>Osnovica</th>
-              <th>PDV</th>
-            </tr>
-          </thead>
-          <tbody>
-            <?php foreach ($parsed['vat_subtotals'] as $v): ?>
-              <tr>
-                <td><?= h($v['source']) ?></td>
-                <td><?= h($v['scheme']) ?></td>
-                <td><?= h($v['category']) ?></td>
-                <td><?= h($v['percent']) ?></td>
-                <td><?= h($v['taxable']) ?> <?= h($parsed['currency']) ?></td>
-                <td><?= h($v['tax']) ?> <?= h($parsed['currency']) ?></td>
-              </tr>
-            <?php endforeach; ?>
-          </tbody>
-        </table>
-      </div>
-    <?php endif; ?>
-
     <div class="card">
       <h3>Stavke</h3>
       <table>
@@ -747,6 +723,46 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         </tbody>
       </table>
     </div>
+    <?php if (!empty($parsed['vat_subtotals'])): ?>
+      <div class="card">
+        <h3>PDV (subtotal)</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Izvor</th>
+              <th>Shema</th>
+              <th>Kategorija</th>
+              <th>Stopa %</th>
+              <th>Osnovica</th>
+              <th>PDV</th>
+              <th>Ukupno</th> <!-- NOVO -->
+            </tr>
+          </thead>
+          <tbody>
+            <?php foreach ($parsed['vat_subtotals'] as $v): ?>
+              <?php
+              // robustno: radi i kad je "12,34"
+              $taxable = (float) str_replace(',', '.', (string)($v['taxable'] ?? '0'));
+              $tax     = (float) str_replace(',', '.', (string)($v['tax'] ?? '0'));
+              $total   = $taxable + $tax;
+
+              // format kao HR (zarez decimale)
+              $totalFmt = number_format($total, 2, ',', '');
+              ?>
+              <tr>
+                <td><?= h($v['source']) ?></td>
+                <td><?= h($v['scheme']) ?></td>
+                <td><?= h($v['category']) ?></td>
+                <td><?= h($v['percent']) ?></td>
+                <td><?= h($v['taxable']) ?> <?= h($parsed['currency']) ?></td>
+                <td><?= h($v['tax']) ?> <?= h($parsed['currency']) ?></td>
+                <td><?= h($totalFmt) ?> <?= h($parsed['currency']) ?></td> <!-- NOVO -->
+              </tr>
+            <?php endforeach; ?>
+          </tbody>
+        </table>
+      </div>
+    <?php endif; ?>
 
     <div class="card">
       <h3>2D barcode za plaćanje</h3>
